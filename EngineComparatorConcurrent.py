@@ -8,6 +8,7 @@ import shutil
 import threading
 import signal
 import time
+import math
 
 # Global flags for clean shutdown
 print_lock = threading.Lock()
@@ -20,7 +21,7 @@ def parse_arguments():
     # Paths
     parser.add_argument("--cutechess", required=True, help="Path to cutechess-cli.exe")
     parser.add_argument("--engines", nargs='+', required=True, help="List of paths to engine executables")
-    parser.add_argument("--openings", required=True, help="Folder containing opening (EPD/FEN) files")
+    parser.add_argument("--openings", required=True, help="Folder containing opening files OR a single .csv/.epd file")
     parser.add_argument("--results", required=True, help="Folder to save PGN results")
 
     # Settings
@@ -55,13 +56,19 @@ def get_engine_name(engine_path):
 
 # --- 3. WORKER FUNCTION ---
 
-def run_tournament_task(args, filename, calculated_hash):
+def run_tournament_task(args, openings_folder, filename, calculated_hash):
     # Check if stop was requested before starting
     if stop_event.is_set():
         return
 
-    openings_file_path = os.path.join(args.openings, filename)
+    openings_file_path = os.path.join(openings_folder, filename)
+    
+    # Identify output name. If using temp chunks, map "chunk_X.epd" -> "results_chunk_X.pgn"
+    # This maintains resume capability if the user restarts with the same CSV.
     result_filename = f"results_{filename}.pgn"
+    if result_filename.endswith(".epd.pgn"):
+        result_filename = result_filename.replace(".epd.pgn", ".pgn")
+        
     final_output_path = os.path.join(args.results, result_filename)
     
     # --- MATH ---
@@ -194,12 +201,76 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
 
     os.makedirs(args.results, exist_ok=True)
-    if not os.path.exists(args.openings):
-        sys.exit(f"Error: Folder {args.openings} not found.")
 
-    files = [f for f in os.listdir(args.openings) if os.path.isfile(os.path.join(args.openings, f))]
-    if not files:
-        sys.exit("No opening files found.")
+    # --- LOGIC TO HANDLE CSV INPUT vs FOLDER INPUT ---
+    active_openings_dir = args.openings
+    files = []
+
+    if os.path.isfile(args.openings):
+        print(f"[INFO] Detected single input file: {args.openings}")
+        print("[INFO] Parsing and splitting into chunks...")
+        
+        # Read FENs from CSV (Output.csv format: FEN,Hit,WDL,ChessEngine)
+        fens = []
+        try:
+            with open(args.openings, 'r', encoding='utf-8-sig') as f:
+                lines = [l.strip() for l in f if l.strip()]
+                start_idx = 0
+                # Basic header detection
+                if "FEN" in lines[0] and "," in lines[0]:
+                    start_idx = 1
+                
+                for line in lines[start_idx:]:
+                    # Extract FEN (everything before first comma)
+                    if "," in line:
+                        fen_part = line.split(",", 1)[0].strip()
+                    else:
+                        fen_part = line.strip()
+                    if fen_part:
+                        fens.append(fen_part)
+        except Exception as e:
+            sys.exit(f"[ERROR] Reading file failed: {e}")
+
+        if not fens:
+            sys.exit("[ERROR] No FENs found in the input file.")
+
+        print(f"[INFO] Loaded {len(fens)} positions.")
+
+        # Create a temp folder inside results to store the split EPDs
+        temp_dir = os.path.join(args.results, "_temp_chunks")
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir)
+        active_openings_dir = temp_dir
+
+        # Split into chunks based on concurrency
+        # Use ceil to ensure we don't drop the last items
+        chunk_size = math.ceil(len(fens) / args.concurrency)
+        
+        for i in range(args.concurrency):
+            start = i * chunk_size
+            end = start + chunk_size
+            chunk = fens[start:end]
+            
+            if not chunk:
+                break
+                
+            chunk_filename = f"chunk_{i+1:02d}.epd"
+            chunk_path = os.path.join(temp_dir, chunk_filename)
+            with open(chunk_path, 'w') as cf:
+                cf.write("\n".join(chunk))
+            
+            files.append(chunk_filename)
+            
+        print(f"[INFO] Created {len(files)} chunks in {temp_dir}")
+
+    elif os.path.isdir(args.openings):
+        active_openings_dir = args.openings
+        files = [f for f in os.listdir(args.openings) if os.path.isfile(os.path.join(args.openings, f))]
+        if not files:
+            sys.exit("No opening files found in the folder.")
+    else:
+        sys.exit(f"Error: {args.openings} is not a valid file or directory.")
 
     # Memory Calculation
     active_threads = args.concurrency * 2
@@ -219,7 +290,8 @@ if __name__ == "__main__":
         # Submit all tasks
         for f in files:
             if stop_event.is_set(): break
-            futures.append(executor.submit(run_tournament_task, args, f, calculated_hash))
+            # Pass active_openings_dir explicitly
+            futures.append(executor.submit(run_tournament_task, args, active_openings_dir, f, calculated_hash))
         
         # Monitor Loop
         while not stop_event.is_set():
