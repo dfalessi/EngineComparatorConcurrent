@@ -2,13 +2,13 @@ import subprocess
 import os
 import sys
 import concurrent.futures
-import multiprocessing
 import argparse
 import shutil
 import threading
 import signal
 import time
 import math
+import csv
 
 # Global flags for clean shutdown
 print_lock = threading.Lock()
@@ -64,7 +64,6 @@ def run_tournament_task(args, openings_folder, filename, calculated_hash):
     openings_file_path = os.path.join(openings_folder, filename)
     
     # Identify output name. If using temp chunks, map "chunk_X.epd" -> "results_chunk_X.pgn"
-    # This maintains resume capability if the user restarts with the same CSV.
     result_filename = f"results_{filename}.pgn"
     if result_filename.endswith(".epd.pgn"):
         result_filename = result_filename.replace(".epd.pgn", ".pgn")
@@ -210,24 +209,38 @@ if __name__ == "__main__":
         print(f"[INFO] Detected single input file: {args.openings}")
         print("[INFO] Parsing and splitting into chunks...")
         
-        # Read FENs from CSV (Output.csv format: FEN,Hit,WDL,ChessEngine)
         fens = []
         try:
-            with open(args.openings, 'r', encoding='utf-8-sig') as f:
-                lines = [l.strip() for l in f if l.strip()]
-                start_idx = 0
-                # Basic header detection
-                if "FEN" in lines[0] and "," in lines[0]:
-                    start_idx = 1
-                
-                for line in lines[start_idx:]:
-                    # Extract FEN (everything before first comma)
-                    if "," in line:
-                        fen_part = line.split(",", 1)[0].strip()
+            # Use CSV DictReader for robustness against extra columns
+            with open(args.openings, 'r', encoding='utf-8-sig', newline='') as f:
+                # Check extension to decide strictly
+                if args.openings.lower().endswith('.csv'):
+                    reader = csv.DictReader(f)
+                    
+                    # Verify 'FEN' column exists
+                    if "FEN" in reader.fieldnames:
+                        for row in reader:
+                            if row["FEN"]:
+                                fens.append(row["FEN"].strip())
                     else:
-                        fen_part = line.strip()
-                    if fen_part:
-                        fens.append(fen_part)
+                        print("[WARNING] 'FEN' column not found in header. Attempting to use the first column.")
+                        f.seek(0)
+                        reader = csv.reader(f)
+                        next(reader, None) # skip header
+                        for row in reader:
+                            if row:
+                                fens.append(row[0].strip())
+                else:
+                    # Fallback for plain .epd or .fen files without headers
+                    for line in f:
+                        clean_line = line.strip()
+                        if clean_line:
+                            # If it looks like CSV, split it, otherwise take whole line
+                            if "," in clean_line:
+                                fens.append(clean_line.split(",", 1)[0].strip())
+                            else:
+                                fens.append(clean_line)
+
         except Exception as e:
             sys.exit(f"[ERROR] Reading file failed: {e}")
 
@@ -245,7 +258,10 @@ if __name__ == "__main__":
 
         # Split into chunks based on concurrency
         # Use ceil to ensure we don't drop the last items
-        chunk_size = math.ceil(len(fens) / args.concurrency)
+        if args.concurrency > 1:
+            chunk_size = math.ceil(len(fens) / args.concurrency)
+        else:
+            chunk_size = len(fens)
         
         for i in range(args.concurrency):
             start = i * chunk_size
